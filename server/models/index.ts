@@ -381,6 +381,11 @@ const PatientSchema = new mongoose.Schema(
     language_preference: String,
     last_check_in: Date,
     medications: [String],
+    active_reminders: [mongoose.Schema.Types.Mixed],
+    daily_med_status: {
+      date: String,
+      statuses: [{ medicine: String, status: String }]
+    },
     patient_user_id: String,
     phone: { type: String, required: true, default: "" },
     status: { type: String, default: "active" },
@@ -1047,6 +1052,7 @@ const CarePlanAssignmentSchema = new mongoose.Schema(
         fasting_sugar: Number,
         postmeal_sugar: Number,
         meds_taken: { type: Boolean, default: false },
+        meds_taken_list: [{ type: String }],
         meals_logged: { type: Number, default: 0 },
         foot_check_done: { type: Boolean, default: false },
         workout_logged: { type: Boolean, default: false },

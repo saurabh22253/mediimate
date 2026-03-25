@@ -14,13 +14,18 @@ import {
   PatientGamification,
   Vital,
   FoodLog,
+  MedicationLog,
   Notification,
   Alert,
   Profile,
   UserRole,
 } from "../models/index.js";
+import multer from "multer";
+import { GoogleGenAI } from "@google/genai";
 
 const router = Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string }); // strictly pass object
 
 type AuthRequest = Request & { user: { id: string } };
 
@@ -162,6 +167,9 @@ router.get("/me/careplan", requireAuth, async (req, res) => {
   const dayStart = startOfToday();
   const dayEnd = endOfToday();
 
+  // Fetch the exact patient document for daily_med_status checking
+  const exactPatient = await Patient.findById(a.patient_id).lean();
+
   const [todayVitals, todayFoodLogs] = await Promise.all([
     Vital.find({
       patient_id: link.patient_id,
@@ -187,7 +195,11 @@ router.get("/me/careplan", requireAuth, async (req, res) => {
       const hour = new Date(v.recorded_at).getHours();
       return notes.includes("post") || notes.includes("after") || hour >= 12;
     }),
-    medicine_confirmed: !!(todayLog?.meds_taken),
+    medicine_confirmed: (() => {
+      const dms = (exactPatient as any)?.daily_med_status;
+      if (!dms || !dms.statuses || dms.statuses.length === 0) return false;
+      return dms.statuses.every((s: any) => s.status === "taken");
+    })(),
     meal_logged: (todayLog?.meals_logged || 0) > 0 || todayFoodLogs.length > 0,
     foot_check_done: !!(todayLog?.foot_check_done),
     workout_logged: !!(todayLog?.workout_logged),
@@ -203,7 +215,60 @@ router.get("/me/careplan", requireAuth, async (req, res) => {
     today_tasks: todayTasks,
     current_week: currentWeek,
     week_theme: weekTheme,
+    medications_status: (exactPatient as any)?.daily_med_status?.statuses || [],
   });
+});
+
+// ─── POST /me/careplan/:assignmentId/voice-log — Multimodal Voice Transcription ───
+router.post("/me/careplan/:assignmentId/voice-log", requireAuth, upload.single("audio"), async (req, res) => {
+  const link = await getPatientForCurrentUser(req);
+  if (!link) return res.status(404).json({ error: "Patient record not linked" });
+
+  if (!req.file || !req.file.buffer) {
+    return res.status(400).json({ error: "Audio file is required" });
+  }
+
+  const exactPatient = await Patient.findById(link.patient_id).lean();
+  const activeMeds = ((exactPatient as any)?.daily_med_status?.statuses || []).map((s: any) => s.medicine);
+
+  const prompt = `You are a clinical AI assisting a patient. They have submitted a voice log describing their health activities.
+Extract their activities into a strict JSON array of intent objects matching this exact schema:
+[
+  { "action": "meal_log", "notes": "what they ate" },
+  { "action": "fasting_sugar_log", "value": <number> },
+  { "action": "postmeal_sugar_log", "value": <number> },
+  { "action": "medicine_confirm", "medsList": ["Medicine A", "Medicine B"] },
+  { "action": "workout_log", "notes": "what they did" },
+  { "action": "foot_check", "notes": "any foot issues mentioned" }
+]
+Rules:
+- If they mention taking medicines, check against their active medications: ${JSON.stringify(activeMeds)}. If they say "I took all my medicines" or similar, include ALL of them in medsList.
+- For sugar logs, guess fasting vs postmeal contextually (e.g., morning/empty stomach = fasting).
+- ONLY output a raw JSON array. Do not wrap in markdown \`\`\`json.`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: req.file.mimetype, data: req.file.buffer.toString("base64") } },
+          ]
+        }
+      ]
+    });
+
+    const output = response.text || "[]";
+    const cleaned = output.replace(/```json/g, "").replace(/```/g, "").trim();
+    const intents = JSON.parse(cleaned);
+
+    return res.json({ intents });
+  } catch (error: any) {
+    console.error("Gemini Voice Parsing Error:", error.message || error);
+    return res.status(500).json({ error: "Failed to transcribe audio or parse intents. Please try again." });
+  }
 });
 
 // ─── POST /me/careplan/:assignmentId/log-action — Log a task ───
@@ -221,7 +286,7 @@ router.post("/me/careplan/:assignmentId/log-action", requireAuth, async (req, re
     return res.status(403).json({ error: "Access denied" });
   }
 
-  const { action, value, timing } = req.body;
+  const { action, value, timing, notes, medsList } = req.body;
   if (!action) return res.status(400).json({ error: "action required" });
 
   const validActions = [
@@ -253,6 +318,7 @@ router.post("/me/careplan/:assignmentId/log-action", requireAuth, async (req, re
       fasting_sugar: null,
       postmeal_sugar: null,
       meds_taken: false,
+      meds_taken_list: [],
       meals_logged: 0,
       foot_check_done: false,
       workout_logged: false,
@@ -263,40 +329,66 @@ router.post("/me/careplan/:assignmentId/log-action", requireAuth, async (req, re
     a.day_logs.push(todayLog);
   }
 
-  // Check if action already done today
-  const alreadyDone =
-    (action === "fasting_sugar_log" && todayLog.fasting_sugar != null) ||
-    (action === "postmeal_sugar_log" && todayLog.postmeal_sugar != null) ||
-    (action === "medicine_confirm" && todayLog.meds_taken) ||
-    (action === "foot_check" && todayLog.foot_check_done) ||
-    (action === "workout_log" && todayLog.workout_logged);
-
-  if (alreadyDone) {
-    return res.status(409).json({ error: "Action already completed today" });
-  }
-
-  // Update today's log based on action
+  let pointsToAward = points;
+  let subActionsCompleted: string[] = [];
   const numericVal = value != null && Number.isFinite(Number(value)) ? Number(value) : null;
 
+  // Determine if action is fully completed and configure points
   if (action === "fasting_sugar_log") {
+    if (todayLog.fasting_sugar != null) return res.status(409).json({ error: "Fasting sugar already logged today" });
     todayLog.fasting_sugar = numericVal;
   } else if (action === "postmeal_sugar_log") {
+    if (todayLog.postmeal_sugar != null) return res.status(409).json({ error: "Post-meal sugar already logged today" });
     todayLog.postmeal_sugar = numericVal;
-  } else if (action === "medicine_confirm") {
-    todayLog.meds_taken = true;
-  } else if (action === "meal_log") {
-    todayLog.meals_logged = (todayLog.meals_logged || 0) + 1;
   } else if (action === "foot_check") {
+    if (todayLog.foot_check_done) return res.status(409).json({ error: "Foot check already done" });
     todayLog.foot_check_done = true;
   } else if (action === "workout_log") {
+    if (todayLog.workout_logged) return res.status(409).json({ error: "Workout already logged" });
     todayLog.workout_logged = true;
+  } else if (action === "meal_log") {
+    todayLog.meals_logged = (todayLog.meals_logged || 0) + 1;
+  } else if (action === "medicine_confirm") {
+    const patientDoc = await Patient.findById(a.patient_id);
+    if (!patientDoc) return res.status(404).json({ error: "Patient not found" });
+
+    const dms = (patientDoc as any).daily_med_status;
+    let anyUpdates = false;
+
+    if (dms && dms.statuses && Array.isArray(medsList)) {
+      for (const medName of medsList) {
+        const medEntry = dms.statuses.find((s: any) => s.medicine === medName);
+        if (medEntry && medEntry.status !== "taken") {
+          medEntry.status = "taken";
+          subActionsCompleted.push(medName);
+          anyUpdates = true;
+        }
+      }
+    }
+
+    if (!anyUpdates) {
+      return res.status(409).json({ error: "Selected medications already taken or invalid" });
+    }
+
+    // Save changes to patient's daily_med_status natively
+    await patientDoc.save();
+
+    // Check if ALL are taken
+    const allTaken = dms.statuses.length > 0 && dms.statuses.every((s: any) => s.status === "taken");
+    
+    if (allTaken) {
+       todayLog.meds_taken = true;
+       pointsToAward = points; // Award full points only when ALL are taken!
+    } else {
+       pointsToAward = 0; // Partial completion does not yield fractional points
+    }
   }
 
-  todayLog.mhp_earned_today = (todayLog.mhp_earned_today || 0) + points;
+  todayLog.mhp_earned_today = (todayLog.mhp_earned_today || 0) + pointsToAward;
 
   // Add to mhp_history
-  a.mhp_history.push({ action, points, date: now, day: currentDay });
-  a.mhp_balance = (a.mhp_balance || 0) + points;
+  a.mhp_history.push({ action, points: pointsToAward, date: now, day: currentDay, notes: subActionsCompleted.length > 0 ? subActionsCompleted.join(", ") : notes });
+  a.mhp_balance = (a.mhp_balance || 0) + pointsToAward;
 
   // Update streak
   const td = todayStr();
@@ -358,7 +450,6 @@ router.post("/me/careplan/:assignmentId/log-action", requireAuth, async (req, re
     }
   }
 
-  // If sugar log: also write to Vital collection
   if ((action === "fasting_sugar_log" || action === "postmeal_sugar_log") && numericVal != null) {
     await Vital.create({
       patient_id: a.patient_id,
@@ -371,6 +462,26 @@ router.post("/me/careplan/:assignmentId/log-action", requireAuth, async (req, re
       source: "careplan",
       notes: action === "fasting_sugar_log" ? "Fasting blood sugar" : "Post-meal blood sugar",
     });
+  } else if (action === "meal_log" && notes) {
+    await FoodLog.create({
+      patient_id: a.patient_id,
+      doctor_id: a.doctor_id,
+      notes,
+      meal_type: "other",
+      logged_at: now,
+      source: "careplan",
+    });
+  } else if (action === "medicine_confirm" && Array.isArray(medsList)) {
+    for (const med of subActionsCompleted) {
+      await MedicationLog.create({
+        patient_id: a.patient_id,
+        doctor_id: a.doctor_id,
+        taken: true,
+        medication_name: med,
+        logged_at: now,
+        source: "careplan",
+      });
+    }
   }
 
   // Update PatientGamification
